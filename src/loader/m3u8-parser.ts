@@ -144,6 +144,37 @@ export default class M3U8Parser {
         }
 
         parsed.levels.push(level);
+
+        // Duplicate level for SUPPLEMENTAL-CODECS
+        const supplementalCodecs = attrs['SUPPLEMENTAL-CODECS'];
+        if (supplementalCodecs?.length) {
+          logger.info(`found SUPPLEMENTAL-CODECS: ${supplementalCodecs}`);
+          supplementalCodecs.split(' ').forEach((supplementalCodec) => {
+            const [codec, profile] = supplementalCodec.split('/');
+            logger.info(
+              `found SUPPLEMENTAL-CODEC: codec=${codec}, profile=${profile}`,
+            );
+
+            const cloneLevel: LevelParsed = {
+              attrs: new AttrList(level.attrs),
+              bitrate: level.bitrate,
+              name: level.name,
+              url: level.url,
+            };
+
+            cloneLevel.attrs.CODECS = codec;
+
+            if (level.width) cloneLevel.width = level.width;
+            if (level.height) cloneLevel.height = level.height;
+
+            // need to convert profile into attribute
+
+            setCodecs(cloneLevel.attrs.CODECS, cloneLevel);
+            if (!cloneLevel.unknownCodecs?.length)
+              levelsWithKnownCodecs.push(cloneLevel);
+            parsed.levels.push(cloneLevel);
+          });
+        }
       } else if (result[3]) {
         const tag = result[3];
         const attributes = result[4];

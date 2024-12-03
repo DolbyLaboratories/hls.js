@@ -196,6 +196,18 @@ export function pickMostCompleteCodecName(
   parsedCodec: string | undefined,
   levelCodec: string | undefined,
 ): string | undefined {
+  // Prefer DolbyVision P8 advertised in the Level, rather than what's on the track
+  if (levelCodec && parsedCodec) {
+    const levelCodecs = levelCodec.split(',');
+    for (let i = levelCodecs.length; i--; ) {
+      if (
+        ['dvh1.08', 'dvhe.08'].indexOf(levelCodecs[i].substring(0, 7)) !== -1
+      ) {
+        return levelCodecs[i];
+      }
+    }
+  }
+
   // Parsing of mp4a codecs strings in mp4-tools from media is incomplete as of d8c6c7a
   // so use level codec is parsed codec is unavailable or incomplete
   if (
