@@ -160,7 +160,7 @@ export default class StreamController
         // hls.nextLoadLevel remains until it is set to a new value or until a new frag is successfully loaded
         hls.nextLoadLevel = startLevel;
         this.level = hls.loadLevel;
-        this._hasEnoughToStart = false;
+        this._hasEnoughToStart = !!skipSeekToStartPosition;
       }
       // if startPosition undefined but lastCurrentTime set, set startPosition to last currentTime
       if (
@@ -733,7 +733,7 @@ export default class StreamController
       return;
     }
     const liveSyncPosition = this.hls.liveSyncPosition;
-    const currentTime = media.currentTime;
+    const currentTime = this.getLoadPosition();
     const start = levelDetails.fragmentStart;
     const end = levelDetails.edge;
     const withinSlidingWindow =
@@ -975,7 +975,7 @@ export default class StreamController
     if (!media) {
       return;
     }
-    if (!this._hasEnoughToStart && media.buffered.length) {
+    if (!this._hasEnoughToStart && BufferHelper.getBuffered(media).length) {
       this._hasEnoughToStart = true;
       this.seekToStartPos();
     }
@@ -1015,13 +1015,15 @@ export default class StreamController
           this.state = State.IDLE;
         }
         break;
+      case ErrorDetails.BUFFER_ADD_CODEC_ERROR:
       case ErrorDetails.BUFFER_APPEND_ERROR:
-      case ErrorDetails.BUFFER_FULL_ERROR:
-        if (!data.parent || data.parent !== 'main') {
+        if (data.parent !== 'main') {
           return;
         }
-        if (data.details === ErrorDetails.BUFFER_APPEND_ERROR) {
-          this.resetLoadingState();
+        this.resetLoadingState();
+        break;
+      case ErrorDetails.BUFFER_FULL_ERROR:
+        if (data.parent !== 'main') {
           return;
         }
         if (this.reduceLengthAndFlushBuffer(data)) {
@@ -1416,7 +1418,7 @@ export default class StreamController
         );
       }
       audio.levelCodec = audioCodec;
-      audio.id = 'main';
+      audio.id = PlaylistLevelType.MAIN;
       this.log(
         `Init audio buffer, container:${
           audio.container
@@ -1428,7 +1430,7 @@ export default class StreamController
     }
     if (video) {
       video.levelCodec = currentLevel.videoCodec;
-      video.id = 'main';
+      video.id = PlaylistLevelType.MAIN;
       const parsedVideoCodec = video.codec;
       if (parsedVideoCodec?.length === 4) {
         // Make up for passthrough-remuxer not being able to parse full codec
@@ -1451,7 +1453,7 @@ export default class StreamController
           video.container
         }, codecs[level/parsed]=[${currentLevel.videoCodec || ''}/${
           parsedVideoCodec
-        }${video.codec !== parsedVideoCodec ? ' parsed-corrected=' + video.codec : ''}}]`,
+        }]${video.codec !== parsedVideoCodec ? ' parsed-corrected=' + video.codec : ''}${video.supplemental ? ' supplemental=' + video.supplemental : ''}`,
       );
       delete tracks.audiovideo;
     }
@@ -1490,10 +1492,12 @@ export default class StreamController
   }
 
   public getMainFwdBufferInfo(): BufferInfo | null {
-    return this.getFwdBufferInfo(
-      this.mediaBuffer ? this.mediaBuffer : this.media,
-      PlaylistLevelType.MAIN,
-    );
+    // Observe video SourceBuffer (this.mediaBuffer) only when alt-audio is used, otherwise observe combined media buffer
+    const bufferOutput =
+      this.mediaBuffer && this.altAudio === AlternateAudio.SWITCHED
+        ? this.mediaBuffer
+        : this.media;
+    return this.getFwdBufferInfo(bufferOutput, PlaylistLevelType.MAIN);
   }
 
   public get maxBufferLength(): number {

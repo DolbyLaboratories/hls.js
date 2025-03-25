@@ -30,6 +30,8 @@ import { hash } from '../utils/hash';
 import { Logger } from '../utils/logger';
 import { isCompatibleTrackChange } from '../utils/mediasource-helper';
 import { getBasicSelectionOption } from '../utils/rendition-helper';
+import { stringify } from '../utils/safe-json-stringify';
+import type { InterstitialPlayer } from './interstitial-player';
 import type { HlsConfig } from '../config';
 import type Hls from '../hls';
 import type { LevelDetails } from '../loader/level-details';
@@ -54,18 +56,16 @@ import type { MediaPlaylist, MediaSelection } from '../types/media-playlist';
 
 export interface InterstitialsManager {
   events: InterstitialEvent[];
-  playerQueue: HlsAssetPlayer[];
   schedule: InterstitialScheduleItem[];
-  bufferingPlayer: HlsAssetPlayer | null;
+  interstitialPlayer: InterstitialPlayer | null;
+  playerQueue: HlsAssetPlayer[];
   bufferingAsset: InterstitialAssetItem | null;
   bufferingItem: InterstitialScheduleItem | null;
   bufferingIndex: number;
   playingAsset: InterstitialAssetItem | null;
   playingItem: InterstitialScheduleItem | null;
   playingIndex: number;
-  waitingIndex: number;
   primary: PlayheadTimes;
-  playout: PlayheadTimes;
   integrated: PlayheadTimes;
   skip: () => void;
 }
@@ -75,7 +75,6 @@ export type PlayheadTimes = {
   currentTime: number;
   duration: number;
   seekableStart: number;
-  seekTo: (time: number) => void;
 };
 
 function playWithCatch(media: HTMLMediaElement | null) {
@@ -121,7 +120,9 @@ export default class InterstitialsController
   private playingItem: InterstitialScheduleItem | null = null;
   private bufferingItem: InterstitialScheduleItem | null = null;
   private waitingItem: InterstitialScheduleEventItem | null = null;
+  private endedItem: InterstitialScheduleItem | null = null;
   private playingAsset: InterstitialAssetItem | null = null;
+  private endedAsset: InterstitialAssetItem | null = null;
   private bufferingAsset: InterstitialAssetItem | null = null;
   private shouldPlay: boolean = false;
 
@@ -194,11 +195,11 @@ export default class InterstitialsController
   }
 
   resumeBuffering() {
-    this.playerQueue.forEach((player) => player.resumeBuffering());
+    this.getBufferingPlayer()?.resumeBuffering();
   }
 
   pauseBuffering() {
-    this.playerQueue.forEach((player) => player.pauseBuffering());
+    this.getBufferingPlayer()?.pauseBuffering();
   }
 
   destroy() {
@@ -258,7 +259,7 @@ export default class InterstitialsController
     event: Events.MEDIA_ATTACHED,
     data: MediaAttachedData,
   ) {
-    const playingItem = this.playingItem;
+    const playingItem = this.effectivePlayingItem;
     const detachedMedia = this.detachedData;
     this.detachedData = null;
     if (playingItem === null) {
@@ -275,7 +276,9 @@ export default class InterstitialsController
     this.playingItem =
       this.bufferingItem =
       this.waitingItem =
+      this.endedItem =
       this.playingAsset =
+      this.endedAsset =
       this.bufferingAsset =
         null;
   }
@@ -297,11 +300,13 @@ export default class InterstitialsController
     if (this.detachedData) {
       const player = this.getBufferingPlayer();
       if (player) {
-        this.playingAsset = null;
-        this.bufferingAsset = null;
-        this.bufferingItem = null;
-        this.waitingItem = null;
-        this.detachedData = null;
+        this.playingAsset =
+          this.endedAsset =
+          this.bufferingAsset =
+          this.bufferingItem =
+          this.waitingItem =
+          this.detachedData =
+            null;
         player.detachMedia();
       }
       this.shouldPlay = false;
@@ -310,12 +315,11 @@ export default class InterstitialsController
 
   public get interstitialsManager(): InterstitialsManager | null {
     if (!this.manager) {
-      if (!this.hls || !this.schedule.events) {
+      if (!this.hls) {
         return null;
       }
       const c = this;
       const effectiveBufferingItem = () => c.bufferingItem || c.waitingItem;
-      const effectivePlayingItem = () => c.playingItem || c.waitingItem;
       const getAssetPlayer = (asset: InterstitialAssetItem | null) =>
         asset ? c.getAssetPlayer(asset.identifier) : asset;
       const getMappedTime = (
@@ -374,7 +378,7 @@ export default class InterstitialsController
         if (value === Number.MAX_VALUE) {
           return getMappedDuration('primary');
         }
-        return value;
+        return Math.max(value, 0);
       };
       const getMappedDuration = (timelineType: TimelineType): number => {
         if (c.primaryDetails?.live) {
@@ -384,21 +388,22 @@ export default class InterstitialsController
         return c.schedule.durations[timelineType];
       };
       const seekTo = (time: number, timelineType: TimelineType) => {
-        const item = effectivePlayingItem();
+        const item = c.effectivePlayingItem;
         if (item?.event?.restrictions.skip) {
           return;
         }
         c.log(`seek to ${time} "${timelineType}"`);
-        const playingItem = effectivePlayingItem();
+        const playingItem = c.effectivePlayingItem;
         const targetIndex = c.schedule.findItemIndexAtTime(time, timelineType);
         const targetItem = c.schedule.items?.[targetIndex];
-        const playingInterstitial = playingItem?.event;
-        const appendInPlace = playingInterstitial?.appendInPlace;
+        const bufferingPlayer = c.getBufferingPlayer();
+        const bufferingInterstitial = bufferingPlayer?.interstitial;
+        const appendInPlace = bufferingInterstitial?.appendInPlace;
         const seekInItem = playingItem && c.itemsMatch(playingItem, targetItem);
         if (playingItem && (appendInPlace || seekInItem)) {
           // seek in asset player or primary media (appendInPlace)
           const assetPlayer = getAssetPlayer(c.playingAsset);
-          const media = assetPlayer?.media || c.hls.media;
+          const media = assetPlayer?.media || c.primaryMedia;
           if (media) {
             const currentTime =
               timelineType === 'primary'
@@ -434,10 +439,12 @@ export default class InterstitialsController
           }
           const targetIsPrimary = !c.isInterstitial(targetItem);
           if (
-            !c.isInterstitial(playingItem) &&
+            (!c.isInterstitial(playingItem) ||
+              playingItem.event.appendInPlace) &&
             (targetIsPrimary || targetItem.event.appendInPlace)
           ) {
-            const media = c.hls.media;
+            const media =
+              c.media || (appendInPlace ? bufferingPlayer?.media : null);
             if (media) {
               media.currentTime = seekToTime;
             }
@@ -458,6 +465,7 @@ export default class InterstitialsController
             let assetIndex = 0;
             if (targetIsPrimary) {
               c.timelinePos = seekToTime;
+              c.checkBuffer();
             } else {
               const assetList = targetItem?.event?.assetList;
               if (assetList) {
@@ -480,6 +488,68 @@ export default class InterstitialsController
           }
         }
       };
+      const getActiveInterstitial = () => {
+        const playingItem = c.effectivePlayingItem;
+        if (c.isInterstitial(playingItem)) {
+          return playingItem;
+        }
+        const bufferingItem = effectiveBufferingItem();
+        if (c.isInterstitial(bufferingItem)) {
+          return bufferingItem;
+        }
+        return null;
+      };
+      const interstitialPlayer: InterstitialPlayer = {
+        get currentTime() {
+          const interstitialItem = getActiveInterstitial();
+          const playingItem = c.effectivePlayingItem;
+          if (playingItem && playingItem === interstitialItem) {
+            return (
+              getMappedTime(
+                playingItem,
+                'playout',
+                c.effectivePlayingAsset,
+                'timelinePos',
+                'currentTime',
+              ) - playingItem.playout.start
+            );
+          }
+          return 0;
+        },
+        set currentTime(time: number) {
+          const interstitialItem = getActiveInterstitial();
+          const playingItem = c.effectivePlayingItem;
+          if (playingItem && playingItem === interstitialItem) {
+            seekTo(time + playingItem.playout.start, 'playout');
+          }
+        },
+        get duration() {
+          const interstitialItem = getActiveInterstitial();
+          if (interstitialItem) {
+            return (
+              interstitialItem.playout.end - interstitialItem.playout.start
+            );
+          }
+          return 0;
+        },
+        get assetPlayers() {
+          const assetList = getActiveInterstitial()?.event.assetList;
+          if (assetList) {
+            return assetList.map((asset) => c.getAssetPlayer(asset.identifier));
+          }
+          return [];
+        },
+        get playingIndex() {
+          const interstitial = getActiveInterstitial()?.event;
+          if (interstitial && c.effectivePlayingAsset) {
+            return interstitial.findAssetIndex(c.effectivePlayingAsset);
+          }
+          return -1;
+        },
+        get scheduleItem() {
+          return getActiveInterstitial();
+        },
+      };
       this.manager = {
         get events() {
           return c.schedule?.events?.slice(0) || [];
@@ -487,34 +557,34 @@ export default class InterstitialsController
         get schedule() {
           return c.schedule?.items?.slice(0) || [];
         },
+        get interstitialPlayer() {
+          if (getActiveInterstitial()) {
+            return interstitialPlayer;
+          }
+          return null;
+        },
         get playerQueue() {
           return c.playerQueue.slice(0);
-        },
-        get bufferingPlayer() {
-          return c.getBufferingPlayer();
         },
         get bufferingAsset() {
           return c.bufferingAsset;
         },
         get bufferingItem() {
-          return c.bufferingItem;
-        },
-        get playingAsset() {
-          return c.playingAsset;
-        },
-        get playingItem() {
-          return c.playingItem;
+          return effectiveBufferingItem();
         },
         get bufferingIndex() {
           const item = effectiveBufferingItem();
           return c.findItemIndex(item);
         },
-        get playingIndex() {
-          const item = effectivePlayingItem();
-          return c.findItemIndex(item);
+        get playingAsset() {
+          return c.effectivePlayingAsset;
         },
-        get waitingIndex() {
-          return c.findItemIndex(c.waitingItem);
+        get playingItem() {
+          return c.effectivePlayingItem;
+        },
+        get playingIndex() {
+          const item = c.effectivePlayingItem;
+          return c.findItemIndex(item);
         },
         primary: {
           get bufferedEnd() {
@@ -522,7 +592,14 @@ export default class InterstitialsController
           },
           get currentTime() {
             const timelinePos = c.timelinePos;
+            const playingItem = c.effectivePlayingItem;
+            if (playingItem?.event?.appendInPlace) {
+              return playingItem.start;
+            }
             return timelinePos > 0 ? timelinePos : 0;
+          },
+          set currentTime(time: number) {
+            seekTo(time, 'primary');
           },
           get duration() {
             return getMappedDuration('primary');
@@ -530,37 +607,6 @@ export default class InterstitialsController
           get seekableStart() {
             return c.primaryDetails?.fragmentStart || 0;
           },
-          seekTo: (time) => seekTo(time, 'primary'),
-        },
-        playout: {
-          get bufferedEnd() {
-            return getMappedTime(
-              effectiveBufferingItem(),
-              'playout',
-              c.bufferingAsset,
-              'bufferedPos',
-              'bufferedEnd',
-            );
-          },
-          get currentTime() {
-            return getMappedTime(
-              effectivePlayingItem(),
-              'playout',
-              c.playingAsset,
-              'timelinePos',
-              'currentTime',
-            );
-          },
-          get duration() {
-            return getMappedDuration('playout');
-          },
-          get seekableStart() {
-            return findMappedTime(
-              c.primaryDetails?.fragmentStart || 0,
-              'playout',
-            );
-          },
-          seekTo: (time) => seekTo(time, 'playout'),
         },
         integrated: {
           get bufferedEnd() {
@@ -574,12 +620,15 @@ export default class InterstitialsController
           },
           get currentTime() {
             return getMappedTime(
-              effectivePlayingItem(),
+              c.effectivePlayingItem,
               'integrated',
-              c.playingAsset,
+              c.effectivePlayingAsset,
               'timelinePos',
               'currentTime',
             );
+          },
+          set currentTime(time: number) {
+            seekTo(time, 'integrated');
           },
           get duration() {
             return getMappedDuration('integrated');
@@ -590,10 +639,9 @@ export default class InterstitialsController
               'integrated',
             );
           },
-          seekTo: (time) => seekTo(time, 'integrated'),
         },
         skip: () => {
-          const item = effectivePlayingItem();
+          const item = c.effectivePlayingItem;
           const event = item?.event;
           if (event && !event.restrictions.skip) {
             const index = c.findItemIndex(item);
@@ -611,6 +659,14 @@ export default class InterstitialsController
   }
 
   // Schedule getters
+  private get effectivePlayingItem(): InterstitialScheduleItem | null {
+    return this.waitingItem || this.playingItem || this.endedItem;
+  }
+
+  private get effectivePlayingAsset(): InterstitialAssetItem | null {
+    return this.playingAsset || this.endedAsset;
+  }
+
   private get playingLastItem(): boolean {
     const playingItem = this.playingItem;
     const items = this.schedule?.items;
@@ -622,7 +678,7 @@ export default class InterstitialsController
   }
 
   private get playbackStarted(): boolean {
-    return this.playingItem !== null;
+    return this.effectivePlayingItem !== null;
   }
 
   // Media getters and event callbacks
@@ -692,7 +748,7 @@ export default class InterstitialsController
       }
       const attachMediaSourceData = player.transferMedia();
       this.log(
-        `transfer MediaSource from ${player} ${JSON.stringify(attachMediaSourceData)}`,
+        `transfer MediaSource from ${player} ${stringify(attachMediaSourceData)}`,
       );
       this.detachedData = attachMediaSourceData;
     } else if (toSegment && playerMedia) {
@@ -704,6 +760,9 @@ export default class InterstitialsController
     player: Hls | HlsAssetPlayer,
     media: HTMLMediaElement,
   ) {
+    if (player.media === media) {
+      return;
+    }
     let attachMediaSourceData: MediaAttachingData | null = null;
     const primaryPlayer = this.hls;
     const isAssetPlayer = player !== primaryPlayer;
@@ -712,32 +771,44 @@ export default class InterstitialsController
     const detachedMediaSource = this.detachedData?.mediaSource;
 
     let logFromSource: string;
-    if (primaryPlayer.media && appendInPlace) {
-      attachMediaSourceData = primaryPlayer.transferMedia();
-      this.detachedData = attachMediaSourceData;
+    if (primaryPlayer.media) {
+      if (appendInPlace) {
+        attachMediaSourceData = primaryPlayer.transferMedia();
+        this.detachedData = attachMediaSourceData;
+      }
       logFromSource = `Primary`;
     } else if (detachedMediaSource) {
       const bufferingPlayer = this.getBufferingPlayer();
       if (bufferingPlayer) {
         attachMediaSourceData = bufferingPlayer.transferMedia();
+        logFromSource = `${bufferingPlayer}`;
+      } else {
+        logFromSource = `detached MediaSource`;
       }
-      logFromSource = `${bufferingPlayer}`;
     } else {
-      logFromSource = `<unknown>`;
+      logFromSource = `detached media`;
     }
-    this.log(
-      `transferring to ${isAssetPlayer ? player : 'Primary'}
-MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
-    );
-
     if (!attachMediaSourceData) {
       if (detachedMediaSource) {
         attachMediaSourceData = this.detachedData;
         this.log(
-          `using detachedData: MediaSource ${JSON.stringify(attachMediaSourceData)}`,
+          `using detachedData: MediaSource ${stringify(attachMediaSourceData)}`,
         );
-      } else if (!this.detachedData || this.hls.media === media) {
-        // Media is attaching when `detachedData` and `hls.media` are populated. Detach to clear the MediaSource.
+      } else if (!this.detachedData || primaryPlayer.media === media) {
+        // Keep interstitial media transition consistent
+        const playerQueue = this.playerQueue;
+        if (playerQueue.length > 1) {
+          playerQueue.forEach((queuedPlayer) => {
+            if (
+              isAssetPlayer &&
+              queuedPlayer.interstitial.appendInPlace !== appendInPlace
+            ) {
+              const interstitial = queuedPlayer.interstitial;
+              this.clearInterstitial(queuedPlayer.interstitial, null);
+              interstitial.appendInPlace = false;
+            }
+          });
+        }
         this.hls.detachMedia();
         this.detachedData = { media };
       }
@@ -751,7 +822,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     this.log(
       `${transferring ? 'transfering MediaSource' : 'attaching media'} to ${
         isAssetPlayer ? player : 'Primary'
-      }`,
+      } from ${logFromSource}`,
     );
     if (dataToAttach === attachMediaSourceData) {
       const isAssetAtEndOfSchedule =
@@ -788,13 +859,23 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     const backwardSeek = diff <= -0.01;
     this.timelinePos = currentTime;
     this.bufferedPos = currentTime;
-    this.checkBuffer();
 
     // Check if seeking out of an item
     const playingItem = this.playingItem;
     if (!playingItem) {
+      this.checkBuffer();
       return;
     }
+    if (backwardSeek) {
+      const resetCount = this.schedule.resetErrorsInRange(
+        currentTime,
+        currentTime - diff,
+      );
+      if (resetCount) {
+        this.updateSchedule();
+      }
+    }
+    this.checkBuffer();
     if (
       (backwardSeek && currentTime < playingItem.start) ||
       currentTime >= playingItem.end
@@ -827,6 +908,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
       if (this.playingLastItem && this.isInterstitial(playingItem)) {
         const restartAsset = playingItem.event.assetList[0];
         if (restartAsset) {
+          this.endedItem = this.playingItem;
           this.playingItem = null;
           this.setScheduleToAssetAtTime(currentTime, restartAsset);
         }
@@ -856,10 +938,10 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     // Only allow timeupdate to advance primary position, seeking is used for jumping back
     // this prevents primaryPos from being reset to 0 after re-attach
     if (currentTime > this.timelinePos) {
+      this.timelinePos = currentTime;
       if (currentTime > this.bufferedPos) {
         this.checkBuffer();
       }
-      this.timelinePos = currentTime;
     } else {
       return;
     }
@@ -898,7 +980,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     }
     // Start stepping through schedule when playback begins for the first time and we have a pre-roll
     const timelinePos = this.timelinePos;
-    const waitingItem = this.waitingItem;
+    const effectivePlayingItem = this.effectivePlayingItem;
     if (timelinePos === -1) {
       const startPosition = this.hls.startPosition;
       this.timelinePos = startPosition;
@@ -911,8 +993,8 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
         const index = schedule.findItemIndexAtTime(start);
         this.setSchedulePosition(index);
       }
-    } else if (waitingItem && !this.playingItem) {
-      const index = schedule.findItemIndex(waitingItem);
+    } else if (effectivePlayingItem && !this.playingItem) {
+      const index = schedule.findItemIndex(effectivePlayingItem);
       this.setSchedulePosition(index);
     }
   }
@@ -943,6 +1025,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
         const resumptionTime = interstitial.resumeTime;
         if (this.timelinePos < resumptionTime) {
           this.timelinePos = resumptionTime;
+          this.checkBuffer();
         }
         this.setSchedulePosition(nextIndex);
       }
@@ -985,11 +1068,12 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
           (assetListIndex !== undefined &&
             assetId !== interstitial.assetList?.[assetListIndex].identifier))
       ) {
-        this.playingAsset = null;
         const assetListIndex = interstitial.findAssetIndex(playingAsset);
         this.log(
           `INTERSTITIAL_ASSET_ENDED ${assetListIndex + 1}/${interstitial.assetList.length} ${eventAssetToString(playingAsset)}`,
         );
+        this.endedAsset = playingAsset;
+        this.playingAsset = null;
         this.hls.trigger(Events.INTERSTITIAL_ASSET_ENDED, {
           asset: playingAsset,
           assetListIndex,
@@ -999,12 +1083,12 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
           player,
         });
         this.retreiveMediaSource(assetId, scheduledItem);
-        if (player.media && !this.detachedData) {
+        if (player.media && !this.detachedData?.mediaSource) {
           player.detachMedia();
         }
-        this.clearAssetPlayer(assetId, scheduledItem);
       }
       if (!this.eventItemsMatch(currentItem, scheduledItem)) {
+        this.endedItem = currentItem;
         this.playingItem = null;
         this.log(
           `INTERSTITIAL_ENDED ${interstitial} ${segmentToString(currentItem)}`,
@@ -1016,7 +1100,6 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
           scheduleIndex: index,
         });
         // Exiting an Interstitial
-        this.clearInterstitial(interstitial, scheduledItem);
         if (interstitial.cue.once) {
           // Remove interstitial with CUE attribute value of ONCE after it has played
           this.updateSchedule();
@@ -1084,7 +1167,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
       const waitingItem = this.waitingItem;
       this.setBufferingItem(scheduledItem);
       let player = this.preloadAssets(interstitial, assetListIndex);
-      if (!this.eventItemsMatch(scheduledItem, currentItem || waitingItem)) {
+      if (!this.eventItemsMatch(scheduledItem, waitingItem || currentItem)) {
         this.waitingItem = scheduledItem;
         this.log(
           `INTERSTITIAL_STARTED ${segmentToString(scheduledItem)} ${interstitial.appendInPlace ? 'append in place' : ''}`,
@@ -1112,7 +1195,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
         return;
       }
       // Update schedule and asset list position now that it can start
-      this.waitingItem = null;
+      this.waitingItem = this.endedItem = null;
       this.playingItem = scheduledItem;
 
       // If asset-list is empty or missing asset index, advance to next item
@@ -1172,6 +1255,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     } else if (playedLastItem && this.isInterstitial(currentItem)) {
       // Maintain playingItem state at end of schedule (setSchedulePosition(-1) called to end program)
       // this allows onSeeking handler to update schedule position
+      this.endedItem = null;
       this.playingItem = currentItem;
       if (!currentItem.event.appendInPlace) {
         // Media must be re-attached to resume primary schedule if not sharing source
@@ -1198,8 +1282,8 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     fromItem: InterstitialScheduleItem | null,
   ) {
     this.playingItem = scheduledItem;
-    this.playingAsset = null;
-    this.waitingItem = null;
+    this.playingAsset = this.endedAsset = null;
+    this.waitingItem = this.endedItem = null;
 
     this.bufferedToItem(scheduledItem);
 
@@ -1273,7 +1357,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     if (item) {
       this.setBufferingItem(item);
     } else {
-      this.bufferingItem = null;
+      this.bufferingItem = this.playingItem;
     }
     this.bufferingAsset = null;
 
@@ -1305,7 +1389,10 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     if (
       !hls.loadingEnabled ||
       !hls.media ||
-      Math.abs(hls.media.currentTime - timelinePos) > 0.5
+      Math.abs(
+        (hls.mainForwardBufferInfo?.start || hls.media.currentTime) -
+          timelinePos,
+      ) > 0.5
     ) {
       hls.startLoad(timelinePos, skipSeekToStartPosition);
     } else if (!hls.bufferingEnabled) {
@@ -1342,9 +1429,12 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
       main,
     };
     this.mediaSelection = currentSelection;
-    this.schedule.parseInterstitialDateRanges(currentSelection);
+    this.schedule.parseInterstitialDateRanges(
+      currentSelection,
+      this.hls.config.interstitialAppendInPlace,
+    );
 
-    if (!this.playingItem && this.schedule.items) {
+    if (!this.effectivePlayingItem && this.schedule.items) {
       this.checkStart();
     }
   }
@@ -1419,7 +1509,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     event: Events.BUFFER_FLUSHED,
     data: BufferFlushedData,
   ) {
-    const { playingItem } = this;
+    const playingItem = this.playingItem;
     if (
       playingItem &&
       !this.itemsMatch(playingItem, this.bufferingItem) &&
@@ -1460,6 +1550,8 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
     if (!this.playingLastItem && playingItem) {
       const playingIndex = this.findItemIndex(playingItem);
       this.setSchedulePosition(playingIndex + 1);
+    } else {
+      this.shouldPlay = false;
     }
   }
 
@@ -1480,9 +1572,6 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
       interstitialEvents.length || removedIds.length
     );
     if (interstitialsUpdated) {
-      if (this.hls.config.interstitialAppendInPlace === false) {
-        interstitialEvents.forEach((event) => (event.appendInPlace = false));
-      }
       this.log(
         `INTERSTITIALS_UPDATED (${
           interstitialEvents.length
@@ -1518,7 +1607,12 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
       const updatedPlayingItem = this.updateItem(playingItem, this.timelinePos);
       if (this.itemsMatch(playingItem, updatedPlayingItem)) {
         this.playingItem = updatedPlayingItem;
+        this.waitingItem = this.endedItem = null;
       }
+    } else {
+      // Clear waitingItem if it has been removed from the schedule
+      this.waitingItem = this.updateItem(this.waitingItem);
+      this.endedItem = this.updateItem(this.endedItem);
     }
     // Do not replace Interstitial bufferingItem without a match - used for transfering media element or source
     const bufferingItem = this.bufferingItem;
@@ -1531,12 +1625,10 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
         this.bufferingItem = updatedBufferingItem;
       } else if (bufferingItem.event) {
         // Interstitial removed from schedule (Live -> VOD or other scenario where Start Date is outside the range of VOD Playlist)
-        this.bufferingItem = null;
+        this.bufferingItem = this.playingItem;
         this.clearInterstitial(bufferingItem.event, null);
       }
     }
-    // Clear waitingItem if it has been removed from the schedule
-    this.waitingItem = this.updateItem(this.waitingItem);
 
     removedInterstitials.forEach((interstitial) => {
       interstitial.assetList.forEach((asset) => {
@@ -1712,21 +1804,29 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
       }
       const isInterstitial = this.isInterstitial(item);
       const bufferingPlayer = this.getBufferingPlayer();
-      const timeRemaining = bufferingPlayer
-        ? bufferingPlayer.remaining
-        : bufferingLast
-          ? bufferingLast.end - this.timelinePos
-          : 0;
-      this.log(
-        `buffered to boundary ${segmentToString(item)}` +
-          (bufferingLast ? ` (${timeRemaining.toFixed(2)} remaining)` : ''),
-      );
       this.bufferingItem = item;
-      this.bufferedPos = item.start;
+      this.bufferedPos = Math.max(
+        item.start,
+        Math.min(item.end, this.timelinePos),
+      );
       if (!this.playbackDisabled) {
+        const timeRemaining = bufferingPlayer
+          ? bufferingPlayer.remaining
+          : bufferingLast
+            ? bufferingLast.end - this.timelinePos
+            : 0;
+        this.log(
+          `buffered to boundary ${segmentToString(item)}` +
+            (bufferingLast ? ` (${timeRemaining.toFixed(2)} remaining)` : ''),
+        );
         if (isInterstitial) {
           // primary fragment loading will exit early in base-stream-controller while `bufferingItem` is set to an Interstitial block
-          this.playerQueue.forEach((player) => player.resumeBuffering());
+          item.event.assetList.forEach((asset) => {
+            const player = this.getAssetPlayer(asset.identifier);
+            if (player) {
+              player.resumeBuffering();
+            }
+          });
         } else {
           this.hls.resumeBuffering();
           this.playerQueue.forEach((player) => player.pauseBuffering());
@@ -1805,18 +1905,18 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
     interstitial: InterstitialEvent,
     assetListIndex: number,
   ): HlsAssetPlayer | null {
+    const uri = interstitial.assetUrl;
     const assetListLength = interstitial.assetList.length;
     const neverLoaded = assetListLength === 0 && !interstitial.assetListLoader;
     const playOnce = interstitial.cue.once;
     if (neverLoaded) {
       this.log(
-        `Load interstitial asset ${assetListIndex + 1}/${assetListLength} ${interstitial}`,
+        `Load interstitial asset ${assetListIndex + 1}/${uri ? 1 : assetListLength} ${interstitial}`,
       );
       const timelineStart = interstitial.timelineStart;
       if (interstitial.appendInPlace) {
-        this.flushFrontBuffer(timelineStart);
+        this.flushFrontBuffer(timelineStart + 0.25);
       }
-      const uri = interstitial.assetUrl;
       if (uri) {
         return this.createAsset(
           interstitial,
@@ -1834,7 +1934,6 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
           liveStartPosition = this.hls.liveSyncPosition || 0;
         }
       }
-      interstitial.assetListResponse = null;
       const assetListLoader = this.assetListLoader.loadAssetList(
         interstitial as InterstitialEventWithAssetList,
         liveStartPosition,
@@ -2142,7 +2241,8 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
     interstitial.assetList.forEach((asset) => {
       this.clearAssetPlayer(asset.identifier, toSegment);
     });
-    interstitial.appendInPlaceStarted = false;
+    // Remove asset list and resolved duration
+    interstitial.reset();
   }
 
   private clearAssetPlayer(
@@ -2180,6 +2280,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
     const assetListLength = interstitial.assetList.length;
 
     const playingAsset = this.playingAsset;
+    this.endedAsset = null;
     this.playingAsset = assetItem;
     if (!playingAsset || playingAsset.identifier !== assetId) {
       if (playingAsset) {
@@ -2193,7 +2294,6 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
       this.log(
         `INTERSTITIAL_ASSET_STARTED ${assetListIndex + 1}/${assetListLength} ${player}`,
       );
-      // player.resumeBuffering();
       this.hls.trigger(Events.INTERSTITIAL_ASSET_STARTED, {
         asset: assetItem,
         assetListIndex,
@@ -2205,9 +2305,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
     }
 
     // detach media and attach to interstitial player if it does not have another element attached
-    if (!player.media) {
-      this.bufferAssetPlayer(player, media);
-    }
+    this.bufferAssetPlayer(player, media);
   }
 
   private bufferAssetPlayer(player: HlsAssetPlayer, media: HTMLMediaElement) {
@@ -2223,11 +2321,19 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
     if (bufferingPlayer === player) {
       return;
     }
+    const appendInPlaceNext = interstitial.appendInPlace;
+    if (
+      appendInPlaceNext &&
+      bufferingPlayer?.interstitial.appendInPlace === false
+    ) {
+      // Media is detached and not available to append in place
+      return;
+    }
     const activeTracks =
       bufferingPlayer?.tracks ||
       this.detachedData?.tracks ||
       this.requiredTracks;
-    if (interstitial.appendInPlace && assetItem !== this.playingAsset) {
+    if (appendInPlaceNext && assetItem !== this.playingAsset) {
       // Do not buffer another item if tracks are unknown or incompatible
       if (!player.tracks) {
         return;
@@ -2316,7 +2422,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
   private primaryFallback(interstitial: InterstitialEvent) {
     // Fallback to Primary by on current or future events by updating schedule to skip errored interstitials/assets
     const flushStart = interstitial.timelineStart;
-    const playingItem = this.playingItem || this.waitingItem;
+    const playingItem = this.effectivePlayingItem;
     // Update schedule now that interstitial/assets are flagged with `error` for fallback
     this.updateSchedule();
     if (playingItem) {
@@ -2328,7 +2434,6 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
         } error: ${interstitial.error}`,
       );
       if (interstitial.appendInPlace) {
-        interstitial.appendInPlace = false;
         this.attachPrimary(flushStart, null);
         this.flushFrontBuffer(flushStart);
       }
@@ -2340,6 +2445,8 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
       if (!this.itemsMatch(playingItem, newPlayingItem)) {
         const scheduleIndex = this.schedule.findItemIndexAtTime(timelinePos);
         this.setSchedulePosition(scheduleIndex);
+      } else {
+        this.clearInterstitial(interstitial, null);
       }
     } else {
       this.checkStart();

@@ -6,6 +6,7 @@ import {
   isSCTE35Attribute,
 } from '../loader/date-range';
 import { MetadataSchema } from '../types/demuxer';
+import { stringify } from '../utils/safe-json-stringify';
 import {
   clearCurrentCues,
   removeCuesInRange,
@@ -54,7 +55,7 @@ function createCueWithDataFields(
     cue = new Cue(
       startTime,
       endTime,
-      JSON.stringify(type ? { type, ...data } : data),
+      stringify(type ? { type, ...data } : data),
     );
   }
   return cue;
@@ -460,7 +461,7 @@ class ID3TrackController implements ComponentAPI {
             this.id3Track.addCue(cue);
             cues[key] = cue;
             if (
-              __USE_INTERSTITALS__ &&
+              __USE_INTERSTITIALS__ &&
               this.hls.config.interstitialsController
             ) {
               if (key === 'X-ASSET-LIST' || key === 'X-ASSET-URL') {

@@ -38,8 +38,8 @@ export type InterstitialAssetItem = {
   parentIdentifier: InterstitialId;
   identifier: InterstitialAssetId;
   duration: number | null;
-  startOffset: number;
-  timelineStart: number;
+  startOffset: number; // asset start offset from start of interstitial event
+  timelineStart: number; // asset start on media element timeline
   uri: string;
   error?: Error;
 };
@@ -104,8 +104,16 @@ export class InterstitialEvent {
   }
 
   public reset() {
+    this.appendInPlaceStarted = false;
     this.assetListLoader?.destroy();
-    this.assetListLoader = this.error = undefined;
+    this.assetListLoader = undefined;
+    if (!this.supplementsPrimary) {
+      this.assetListResponse = null;
+      this.assetList = [];
+      this._duration = null;
+    }
+    // `error?` is reset when seeking back over interstitial `startOffset`
+    //  using `schedule.resetErrorsInRange(start, end)`.
   }
 
   public isAssetPastPlayoutLimit(assetIndex: number): boolean {

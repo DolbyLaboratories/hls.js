@@ -9,9 +9,17 @@ import {
 } from '../loader/interstitial-event';
 import { BufferHelper } from '../utils/buffer-helper';
 import type { HlsConfig } from '../config';
+import type { InterstitialScheduleEventItem } from '../controller/interstitials-schedule';
 import type Hls from '../hls';
 import type { BufferCodecsData, MediaAttachingData } from '../types/events';
 
+export interface InterstitialPlayer {
+  currentTime: number;
+  duration: number;
+  assetPlayers: (HlsAssetPlayer | null)[];
+  playingIndex: number;
+  scheduleItem: InterstitialScheduleEventItem | null;
+}
 export class HlsAssetPlayer {
   public readonly hls: Hls;
   public readonly interstitial: InterstitialEvent;
@@ -19,7 +27,7 @@ export class HlsAssetPlayer {
   public tracks: Partial<BufferCodecsData> | null = null;
   private hasDetails: boolean = false;
   private mediaAttached: HTMLMediaElement | null = null;
-  private playoutOffset: number = 0;
+  private _currentTime?: number;
 
   constructor(
     HlsPlayerClass: typeof Hls,
@@ -49,8 +57,6 @@ export class HlsAssetPlayer {
       this.mediaAttached = media;
       const event = this.interstitial;
       if (event.playoutLimit) {
-        this.playoutOffset =
-          event.assetList[event.assetList.indexOf(assetItem)]?.startOffset || 0;
         media.addEventListener('timeupdate', this.checkPlayout);
       }
     });
@@ -59,7 +65,8 @@ export class HlsAssetPlayer {
   private checkPlayout = () => {
     const interstitial = this.interstitial;
     const playoutLimit = interstitial.playoutLimit;
-    if (this.playoutOffset + this.currentTime >= playoutLimit) {
+    const currentTime = this.currentTime;
+    if (this.startOffset + currentTime >= playoutLimit) {
       this.hls.trigger(Events.PLAYOUT_LIMIT_REACHED, {});
     }
   };
@@ -83,7 +90,7 @@ export class HlsAssetPlayer {
   get bufferedEnd(): number {
     const media = this.media || this.mediaAttached;
     if (!media) {
-      return 0;
+      return this.currentTime;
     }
     const bufferInfo = BufferHelper.bufferInfo(media, media.currentTime, 0.001);
     return this.getAssetTime(bufferInfo.end);
@@ -92,13 +99,13 @@ export class HlsAssetPlayer {
   get currentTime(): number {
     const media = this.media || this.mediaAttached;
     if (!media) {
-      return 0;
+      return this._currentTime || 0;
     }
     return this.getAssetTime(media.currentTime);
   }
 
   get duration(): number {
-    const duration = this.assetItem?.duration;
+    const duration = this.assetItem.duration;
     if (!duration) {
       return 0;
     }
@@ -111,6 +118,10 @@ export class HlsAssetPlayer {
       return 0;
     }
     return Math.max(0, duration - this.currentTime);
+  }
+
+  get startOffset(): number {
+    return this.assetItem.startOffset;
   }
 
   get timelineOffset(): number {
@@ -141,6 +152,7 @@ export class HlsAssetPlayer {
   private removeMediaListeners() {
     const media = this.mediaAttached;
     if (media) {
+      this._currentTime = media.currentTime;
       media.removeEventListener('timeupdate', this.checkPlayout);
     }
   }
@@ -160,6 +172,7 @@ export class HlsAssetPlayer {
 
   detachMedia() {
     this.removeMediaListeners();
+    this.mediaAttached = null;
     this.hls.detachMedia();
   }
 
@@ -200,6 +213,6 @@ export class HlsAssetPlayer {
   }
 
   toString(): string {
-    return `HlsAssetPlayer: ${eventAssetToString(this.assetItem)} ${this.hls.sessionId} ${this.interstitial.appendInPlace ? 'append-in-place' : ''}`;
+    return `HlsAssetPlayer: ${eventAssetToString(this.assetItem)} ${this.hls?.sessionId} ${this.interstitial?.appendInPlace ? 'append-in-place' : ''}`;
   }
 }

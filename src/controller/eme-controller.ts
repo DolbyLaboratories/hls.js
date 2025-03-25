@@ -27,6 +27,7 @@ import {
   type PsshInvalidResult,
 } from '../utils/mp4-tools';
 import { base64Decode } from '../utils/numeric-encoding-utils';
+import { stringify } from '../utils/safe-json-stringify';
 import { strToUtf8array } from '../utils/utf8-utils';
 import type { EMEControllerConfig, HlsConfig, LoadPolicy } from '../config';
 import type Hls from '../hls';
@@ -254,7 +255,7 @@ class EMEController extends Logger implements ComponentAPI {
     let keySystemAccess = keySystemAccessPromises?.keySystemAccess;
     if (!keySystemAccess) {
       this.log(
-        `Requesting encrypted media "${keySystem}" key-system access with config: ${JSON.stringify(
+        `Requesting encrypted media "${keySystem}" key-system access with config: ${stringify(
           mediaKeySystemConfigs,
         )}`,
       );
@@ -519,7 +520,7 @@ class EMEController extends Logger implements ComponentAPI {
           details: ErrorDetails.KEY_SYSTEM_NO_CONFIGURED_LICENSE,
           fatal: true,
         },
-        `Missing key-system license configuration options ${JSON.stringify({
+        `Missing key-system license configuration options ${stringify({
           drmSystems: this.config.drmSystems,
         })}`,
       );
@@ -553,7 +554,7 @@ class EMEController extends Logger implements ComponentAPI {
     this.keyFormatPromise.then((keySystemFormat) => {
       const keySystem = keySystemFormatToKeySystemDomain(keySystemFormat);
 
-      let keyId: Uint8Array | null | undefined;
+      let keyId: Uint8Array<ArrayBuffer> | null | undefined;
       let keySystemDomain: KeySystems | undefined;
 
       if (initDataType === 'sinf') {
@@ -573,7 +574,7 @@ class EMEController extends Logger implements ComponentAPI {
               `'schm' box missing or not cbcs/cenc with schi > tenc`,
             );
           }
-          keyId = tenc.subarray(8, 24);
+          keyId = new Uint8Array(tenc.subarray(8, 24));
           keySystemDomain = KeySystems.FAIRPLAY;
         } catch (error) {
           this.warn(`${logMessage} Failed to parse sinf: ${error}`);
@@ -628,7 +629,7 @@ class EMEController extends Logger implements ComponentAPI {
         if (psshInfo.version === 0 && psshInfo.data) {
           if (keySystemDomain === KeySystems.WIDEVINE) {
             const offset = psshInfo.data.length - 22;
-            keyId = psshInfo.data.subarray(offset, offset + 16);
+            keyId = new Uint8Array(psshInfo.data.subarray(offset, offset + 16));
           } else if (keySystemDomain === KeySystems.PLAYREADY) {
             keyId = parsePlayReadyWRM(psshInfo.data);
           }
@@ -695,7 +696,7 @@ class EMEController extends Logger implements ComponentAPI {
                 keySystemToKeySystemFormat(keySystem) ?? '',
               );
               decryptdata.pssh = new Uint8Array(initData);
-              decryptdata.keyId = keyId as Uint8Array;
+              decryptdata.keyId = keyId;
               return this.attemptSetMediaKeys(keySystem, mediaKeys).then(() => {
                 this.throwIfDestroyed();
                 const keySessionContext = this.createMediaKeySessionContext({
